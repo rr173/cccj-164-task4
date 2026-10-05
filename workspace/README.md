@@ -9,7 +9,135 @@
 
 ---
 
-## 快速开始
+## 只读灾备复制器（DR Replicator）
+
+在主站之上内置一套**只读灾备复制器**：从主站持续拉取带序号与哈希链的
+事件**分段**，本地校验后原子更新只读投影；支持受控切换演练、带任期
+只读地址、故障分段隔离与离线审计。代码在 `quota/replica/`，操作页面
+在 `quota/replica_static/`，测试见 `test_replica.py`（81 项）。
+
+### 快速开始
+
+```bash
+# 一体化演示（主站 + feed + 灾备同进程；写接口 /api，灾备 /dr）
+python3 -m quota.replica --mode demo --port 8765
+#   灾备运维页面: http://localhost:8765/dr/
+
+# 真实部署：主站（带复制 feed，进程重启自动换届）
+python3 -m quota.replica --mode primary --quota-db ./quota.db --port 8765
+# 独立灾备节点（跨进程 HTTP 拉取）
+python3 -m quota.replica --mode dr --primary-url http://主站:8765 \
+    --dr-db ./dr.db --port 8770 --lag-limit 1000
+
+# 离线审计
+python3 -m quota.replica.audit --db ./dr.db          # 文本
+python3 -m quota.replica.audit --db ./dr.db --json   # JSON（失败退出码 2）
+```
+
+### 分段与双链
+
+每条写命令的**原子批次**在主站 `append_batch` 的**同一个 SQLite 事务**
+内被密封为一个分段：段与业务事件同时可见，主站崩溃不会产生「事件已
+落账、分段缺失」的窗口。分段带：
+
+- `term`（主站任期，主站进程重启 / 显式换届 +1）、`index`（全局严格
+  连续，从 1 开始）、`from_seq/to_seq`、`batch_id`；
+- **段链**：`prev_digest → digest`，摘要覆盖整段规范正文（含每事件的
+  event_hash 与载荷）；
+- **事件链**：分段内事件保留主站 per-event SHA-256 链，且段首事件
+  `prev_hash` 锚定上段末事件 `event_hash` —— 两条链互相锚定。
+
+### 原子可见的确认截面
+
+复制器顺序执行「准入 → 双链校验 → 单 SQLite 事务落账 → 同一临界区
+折叠内存投影」，确认边界只在事务提交后前进。只读接口
+（`GET /dr/api/state`）只暴露已确认边界，因此主站持续写入时灾备查询
+**绝不会**看到「事件已进入、但余额/租约/草案/命令结果只更新一部分」
+的半成品截面。重复拉取内容一致即幂等忽略，绝不重复应用；传输中断或
+进程重启后从最后确认的 `(index, seq)` 继续（重启时从已确认事件重放
+重建投影）。
+
+### 隔离与熔断（不污染最近可用截面）
+
+下列分段一律写入**隔离区**（保留正文+原因+时间）并进入 `QUARANTINED`
+熔断态，未经运维处置不再推进，最近可用截面保持不变：
+
+| 原因码 | 触发条件 |
+|---|---|
+| `gap` | 分段缺失：index 不是确认边界的下一段 |
+| `out_of_order` | 错序：index 落在已确认范围且无记录 |
+| `same_index_diff_body` | 同序号正文不同（摘要不一致） |
+| `digest_mismatch` | 段摘要自校验失败（正文/摘要被改） |
+| `chain_broken` | 段链断裂：prev_digest 未指向上段 |
+| `event_chain_broken` / `event_payload_tampered` | 事件 prev_hash 断链 / event_hash 重算不符 |
+| `batch_split` | 同一 command_id 的事件跨越分段边界 |
+| `seq_mismatch` | from/to_seq 或事件 seq 不连续 |
+| `stale_term` | **旧任期进程迟到更新**（term 落后） |
+| `new_term` | 主站已换届，未显式 `adopt-term` 前拒绝 |
+| `malformed` | 信封结构非法 |
+
+落后量超过 `--lag-limit` 时标记 `LAGGING`（截面仍完整但禁止演练），
+追平后自动恢复。运维确认后 `POST /dr/api/control/resume` 解除熔断
+（隔离记录保留用于审计）。
+
+### 受控切换演练
+
+1. `POST /dr/api/drills {"idem_key":..., "ttl_seconds":...}` ——
+   原子锁定当前确认截面并**暂停拉取**；稳定窗口后复检主站水位，然后
+   执行 7 项验证：锁定边界、段链、事件链（含跨段锚定）、重放等价、
+   投影守恒（非负余额 + Σ可用+总消费==容量）、命令结果完整（用户命令
+   批次不被拆分、回执齐备）、**验证期间无新分段**。
+2. 通过后 `POST /dr/api/drills/{id}/issue` 发放**带任期的不透明只读
+   地址** `/ro/{token}/state`（另附 `/audit` 报告）。地址只看到锁定
+   截面（按 locked_seq 独立折叠并缓存），复制追赶与它无关。
+3. **同一 `idem_key` 再次创建/发放返回原结果**（幂等）；
+   `POST /dr/api/drills/{id}/cancel` 后地址立即失效（410）并恢复复制；
+   TTL 到期地址 410。
+4. **验证时主站又密封了新分段** → 演练失败（`new_segments_during_verification`）、
+   不发地址、自动恢复复制；同键重试保持原失败结果。
+5. 主站换届 / `adopt-term` 推进持久化 **fence** 时，所有未完成演练地址
+   立即作废（`invalidated_by_term_change`）。
+
+### HTTP 接口（灾备侧）
+
+| 方法 / 路径 | 说明 |
+|---|---|
+| `GET /dr/api/status` | 复制进度、任期、确认边界、实时落后、隔离数、暂停/fence |
+| `POST /dr/api/tick` | 立即执行一轮拉取（排障/测试） |
+| `GET /dr/api/state` | **最近已确认只读截面**（节点余额/租约/草案视图） |
+| `GET /dr/api/segments` | 已确认分段（段链） |
+| `GET /dr/api/quarantine` | 隔离区（原因/正文/时间） |
+| `GET /dr/api/audit` · `GET /dr/api/audit-log` | 在线一致性审计 · 任务审计日志 |
+| `POST /dr/api/control/pause` · `resume` · `adopt-term` | 暂停 / 恢复 / 显式接管任期 |
+| `POST /dr/api/drills` · `GET /dr/api/drills[/{id}]` | 创建（锁定+验证）/ 列表 / 报告 |
+| `POST /dr/api/drills/{id}/issue` · `cancel` | 发放带任期只读地址 / 取消失效 |
+| `GET /ro/{token}/state` · `/ro/{token}/audit` | 锁定截面只读查询 / 演练验证报告 |
+| `GET /dr/` | 灾备运维操作页面 |
+
+主站 feed（仅安装复制器后存在）：`GET /api/feed/status`、
+`GET /api/feed/segments?after=&limit=`；一体化/`--allow-inject` 下另有
+`POST /api/feed/bump-term`、`/api/feed/inject`（digest/payload/drop
+故障注入，仅测试）、`/api/feed/clear-injection`。
+
+### 代码结构（新增）
+
+| 文件 | 职责 |
+|---|---|
+| `quota/ledger.py` | 新增事务内 `batch_hook`（默认不安装，主站行为不变） |
+| `quota/replica/protocol.py` | 分段信封、段摘要、事件哈希重算、隔离原因码 |
+| `quota/replica/feed.py` | 主站分段密封器（与事件同事务）、任期、故障注入 |
+| `quota/replica/store.py` | 灾备任务库：确认边界/事件/回执/分段/隔离/演练/审计 |
+| `quota/replica/replicator.py` | 拉取循环、准入校验、幂等、隔离熔断、任期栅栏、只读投影 |
+| `quota/replica/drill.py` | 演练生命周期、锁定截面、带任期只读地址、TTL/取消 |
+| `quota/replica/verify.py` | 演练截面 7 项验证 |
+| `quota/replica/audit.py` · `audit_cli.py` | 在线/离线一致性审计与命令行 |
+| `quota/replica/server.py` · `__main__.py` | 灾备 HTTP 接口与 primary/dr/demo 三种启动模式 |
+| `quota/replica_static/index.html` | 灾备运维操作页面 |
+| `test_replica.py` | 81 项灾备端到端测试（含真实 HTTP、重启、换届、故障注入） |
+
+---
+
+## 快速开始（主站）
 
 ```bash
 python3 -m quota.http_server --port 8765 --db ./quota.db
@@ -17,10 +145,11 @@ python3 -m quota.http_server --port 8765 --db ./quota.db
 ```
 
 跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改 /
-批量容量草案，共 220 项）：
+批量容量草案，共 220 项；灾备复制器另见 81 项 `test_replica.py`）：
 
 ```bash
 python3 test_service.py
+python3 test_replica.py
 ```
 
 ---

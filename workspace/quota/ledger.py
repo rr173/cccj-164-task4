@@ -70,6 +70,9 @@ class EventStore:
         self.path = path
         first_time = not os.path.exists(path)
         self._lock = threading.RLock()
+        # 可选的事务内批次钩子（灾备分段密封器安装后非空）：
+        # 在 append_batch 的同一事务、同一连接内调用，随事务一起提交/回滚
+        self.batch_hook = None
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -263,6 +266,12 @@ class EventStore:
                 )
             if plan_change is not None:
                 self._upsert_plan_locked(plan_change)
+            if self.batch_hook is not None:
+                # 灾备 feed：在同一事务内把本批密封为一个分段，
+                # 与事件/命令回执/草案行原子提交
+                self.batch_hook(
+                    self.conn, list(seqs), command_id, fingerprint, result, system
+                )
         return seqs
 
     def _upsert_plan_locked(self, ch: dict[str, Any]) -> None:
