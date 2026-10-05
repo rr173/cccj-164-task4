@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .domain import DomainError, ValidationError
+from .feed import CHAOS_MODES, Feed
 from .service import QuotaService
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -84,6 +85,9 @@ class Handler(BaseHTTPRequestHandler):
             data["command_id"] = header_key
         return data
 
+    def _feed(self) -> Feed:
+        return self.server.feed  # type: ignore[attr-defined]
+
     def _service(self) -> QuotaService:
         return self.server.service  # type: ignore[attr-defined]
 
@@ -113,6 +117,21 @@ class Handler(BaseHTTPRequestHandler):
                 plan_id = path[len("/api/capacity-plans/") :].strip("/")
                 if plan_id:
                     return self._json(200, self._service().get_plan(plan_id))
+            if path == "/replica/status":
+                return self._json(200, self._feed().status())
+            if path == "/replica/segments":
+                return self._json(200, {"segments": self._feed().status()["segments"]})
+            if path.startswith("/replica/segments/"):
+                raw = path[len("/replica/segments/") :].strip("/")
+                if raw.isdigit():
+                    env = self._feed().get_segment(int(raw))
+                    if env is None:
+                        return self._json(
+                            404,
+                            {"error": "segment_unavailable",
+                             "message": f"分段 {raw} 缺失或尚未密封"},
+                        )
+                    return self._json(200, env)
             if path in ("/", "/index.html"):
                 return self._serve_static("index.html", "text/html; charset=utf-8")
             if path.startswith("/static/"):
@@ -129,6 +148,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
+            if path == "/replica/chaos":
+                # 故障注入：仅在服务以 --allow-feed-chaos 启动时可用
+                if not getattr(self.server, "allow_feed_chaos", False):
+                    return self._json(
+                        403,
+                        {"error": "chaos_disabled",
+                         "message": "主站未开启 --allow-feed-chaos，故障注入被拒绝"},
+                    )
+                body = self._read_body()
+                mode = body.get("mode")
+                if mode is not None and mode not in CHAOS_MODES:
+                    return self._json(
+                        400,
+                        {"error": "bad_mode",
+                         "message": f"mode 必须是 {sorted(CHAOS_MODES)} 或 null"},
+                    )
+                idx = body.get("segment_index")
+                if idx is not None and (not isinstance(idx, int) or idx < 1):
+                    return self._json(400, {"error": "bad_index",
+                                           "message": "segment_index 必须是 >= 1 的整数"})
+                return self._json(200, {"chaos": self._feed().set_chaos(mode, idx)})
             if path.startswith("/api/capacity-plans/"):
                 action = path[len("/api/capacity-plans/") :].strip("/")
                 plan_methods = {
@@ -193,9 +233,17 @@ class Handler(BaseHTTPRequestHandler):
         return "application/octet-stream"
 
 
-def create_server(host: str, port: int, db_path: str) -> ThreadingHTTPServer:
+def create_server(
+    host: str,
+    port: int,
+    db_path: str,
+    segment_size: int = 10,
+    allow_feed_chaos: bool = False,
+) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.service = QuotaService(db_path)  # type: ignore[attr-defined]
+    httpd.feed = Feed(httpd.service.store, segment_size=segment_size)  # type: ignore[attr-defined]
+    httpd.allow_feed_chaos = allow_feed_chaos  # type: ignore[attr-defined]
     httpd.app_log = lambda msg: print(f"[quota] {msg}", flush=True)  # type: ignore[attr-defined]
     return httpd
 
@@ -209,12 +257,25 @@ def main() -> None:
     parser.add_argument(
         "--db", default=os.environ.get("QUOTA_DB", os.path.join(os.getcwd(), "quota.db"))
     )
+    parser.add_argument(
+        "--segment-size", type=int, default=int(os.environ.get("SEGMENT_SIZE", "10")),
+        help="灾备馈源的密封分段大小（事件数/分段）",
+    )
+    parser.add_argument(
+        "--allow-feed-chaos", action="store_true",
+        help="开启灾备馈源的故障注入面（仅测试/演练环境）",
+    )
     args = parser.parse_args()
 
-    httpd = create_server(args.host, args.port, args.db)
+    httpd = create_server(
+        args.host, args.port, args.db,
+        segment_size=args.segment_size,
+        allow_feed_chaos=args.allow_feed_chaos,
+    )
     print(
         f"[quota] 服务已启动: http://{args.host}:{args.port}  "
-        f"(账本 {args.db})",
+        f"(账本 {args.db}，分段大小 {args.segment_size}，"
+        f"故障注入 {'开' if args.allow_feed_chaos else '关'})",
         flush=True,
     )
     try:
